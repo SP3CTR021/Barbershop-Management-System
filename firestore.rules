@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ------------------------------------------------------------------------
+    // Helper Functions
+    // Denormalized `roleName` on `users/{uid}` reduces RBAC rule evaluation
+    // to a single `get()` call instead of chained `users -> roles` lookups.
+    // ------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function userExists() {
+      return isSignedIn() && exists(userPath());
+    }
+
+    function userData() {
+      return get(userPath()).data;
+    }
+
+    function isActiveUser() {
+      return userExists() && userData().isActive == true;
+    }
+
+    function isActiveOwner() {
+      return isActiveUser() && userData().roleName == 'OWNER';
+    }
+
+    function isActiveStaffOrOwner() {
+      return isActiveUser() && (
+        userData().roleName == 'STAFF' || userData().roleName == 'OWNER'
+      );
+    }
+
+    function isBootstrapOwnerOpen() {
+      return isSignedIn() &&
+        !exists(/databases/$(database)/documents/_unique_constraints/bootstrap_owner);
+    }
+
+    // ------------------------------------------------------------------------
+    // ROLES
+    // ------------------------------------------------------------------------
+    match /roles/{roleId} {
+      allow read: if isSignedIn();
+      allow write: if isActiveOwner() ||
+        (isSignedIn() &&
+          !exists(/databases/$(database)/documents/roles/role_owner));
+    }
+
+    // ------------------------------------------------------------------------
+    // UNIQUE CONSTRAINT LOCKS (username, email, serviceName, barberUser, etc.)
+    // Allows unauthenticated `get` on `username_*` docs for pre-login email lookup.
+    // ------------------------------------------------------------------------
+    match /_unique_constraints/{lockId} {
+      allow get: if lockId.matches('username_.*') || isActiveStaffOrOwner();
+      allow list: if isActiveStaffOrOwner();
+      allow create, update, delete: if isActiveStaffOrOwner() || isBootstrapOwnerOpen();
+    }
+
+    // ------------------------------------------------------------------------
+    // USERS (soft-delete only via `isActive`)
+    // ------------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isActiveStaffOrOwner() ||
+        (isSignedIn() && request.auth.uid == userId);
+      allow create: if isActiveOwner() ||
+        (isBootstrapOwnerOpen() && request.auth.uid == userId);
+      allow update: if isActiveOwner();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // BARBERS (soft-delete only via `status`)
+    // ------------------------------------------------------------------------
+    match /barbers/{barberId} {
+      allow read: if isActiveStaffOrOwner();
+      allow create, update: if isActiveOwner();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // CUSTOMERS
+    // ------------------------------------------------------------------------
+    match /customers/{customerId} {
+      allow read, create, update, delete: if isActiveStaffOrOwner();
+    }
+
+    // ------------------------------------------------------------------------
+    // SERVICES (soft-delete only via `isActive`)
+    // ------------------------------------------------------------------------
+    match /services/{serviceId} {
+      allow read: if isActiveStaffOrOwner();
+      allow create, update: if isActiveOwner();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // ATTENDANCE (deterministic doc ID: {barberId}_{yyyy-MM-dd})
+    // ------------------------------------------------------------------------
+    match /attendance/{attendanceId} {
+      allow read, create, update: if isActiveStaffOrOwner();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // TRANSACTIONS & ITEMS SUBCOLLECTION
+    // STAFF can update/void only PENDING transactions; OWNER can void PAID.
+    // ------------------------------------------------------------------------
+    match /transactions/{txId} {
+      allow read, create: if isActiveStaffOrOwner();
+      allow update: if isActiveOwner() ||
+        (isActiveStaffOrOwner() && resource.data.status == 'PENDING');
+      allow delete: if false;
+
+      match /items/{itemId} {
+        allow read, create: if isActiveStaffOrOwner();
+        allow update, delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // PAYMENTS (top-level collection for date-range & tender reconciliation)
+    // ------------------------------------------------------------------------
+    match /payments/{paymentId} {
+      allow read, create: if isActiveStaffOrOwner();
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------------------
+    // PAYROLL_SETTINGS, PAYROLL_PERIODS, PAYROLL_RECORDS
+    // ------------------------------------------------------------------------
+    match /payroll_settings/{settingId} {
+      allow read: if isActiveStaffOrOwner();
+      allow create, update: if isActiveOwner();
+      allow delete: if false;
+    }
+
+    match /payroll_periods/{periodId} {
+      allow read: if isActiveStaffOrOwner();
+      allow create, update: if isActiveOwner();
+      allow delete: if isActiveOwner() && resource.data.status == 'DRAFT';
+    }
+
+    match /payroll_records/{payrollId} {
+      allow read: if isActiveStaffOrOwner();
+      allow create, update, delete: if isActiveOwner();
+    }
+  }
+}
